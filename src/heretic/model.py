@@ -235,8 +235,8 @@ class Model:
             )
         return None
 
-    def _is_fp8_quantized(self) -> bool:
-        """Check if the loaded model uses FP8 quantization (e.g. compressed-tensors)."""
+    def _is_natively_quantized(self) -> bool:
+        """Check if the loaded model uses native quantization (e.g. compressed-tensors FP8/INT4, fbgemm_fp8)."""
         if self.model is None:
             return False
         # PeftModel.config delegates to the underlying model's config,
@@ -289,10 +289,10 @@ class Model:
             merged_model = peft_model.merge_and_unload()
             return merged_model
         else:
-            # Non-quantized or FP8 model - merge directly.
-            # For FP8 (compressed-tensors), PEFT handles dequantization during merge.
-            if self._is_fp8_quantized():
-                print("* Merging LoRA adapters into FP8 model (output will be in full precision)...")
+            # Non-quantized or natively quantized model - merge directly.
+            # For compressed-tensors (FP8/INT4), PEFT handles dequantization during merge.
+            if self._is_natively_quantized():
+                print("* Merging LoRA adapters into natively quantized model (non-quantized layers will be in full precision)...")
             else:
                 print("* Merging LoRA adapters into base model...")
             merged_model = self.model.merge_and_unload()
@@ -352,9 +352,13 @@ class Model:
         if isinstance(model, PeftModel):
             model = model.base_model.model
 
-        # Most multimodal models.
+        # Most multimodal models (e.g. Mllama).
         with suppress(Exception):
             return model.model.language_model.layers
+
+        # Multimodal models where language_model is a top-level attribute (e.g. Kimi-K2.5).
+        with suppress(Exception):
+            return model.language_model.model.layers
 
         # Text-only models.
         return model.model.layers
@@ -408,9 +412,9 @@ class Model:
             for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
 
-        # GLM-5 (GlmMoeDsa) MoE layers have shared experts with standard MLP structure.
-        # The routed experts use fused 3D parameter tensors (nn.Parameter, not nn.Module),
-        # so only the shared experts can be targeted by LoRA.
+        # DeepseekV3 / GLM-5 (GlmMoeDsa) / Kimi-K2.5 MoE layers have shared experts
+        # with standard MLP structure. The routed experts use fused 3D parameter tensors
+        # (nn.Parameter, not nn.Module), so only the shared experts can be targeted by LoRA.
         with suppress(Exception):
             try_add("mlp.down_proj", layer.mlp.shared_experts.down_proj)  # ty:ignore[possibly-missing-attribute]
 
