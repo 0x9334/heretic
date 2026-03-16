@@ -136,6 +136,8 @@ class Model:
 
             if settings.quantization == QuantizationMethod.BNB_4BIT:
                 print("[green]Ok[/] (quantized to 4-bit precision)")
+            elif self._is_fp8_quantized():
+                print("[green]Ok[/] (FP8 quantized)")
             else:
                 print("[green]Ok[/]")
 
@@ -233,6 +235,22 @@ class Model:
             )
         return None
 
+    def _is_fp8_quantized(self) -> bool:
+        """Check if the loaded model uses FP8 quantization (e.g. compressed-tensors)."""
+        if self.model is None:
+            return False
+        # PeftModel.config delegates to the underlying model's config,
+        # so self.model.config works for both PeftModel and PreTrainedModel.
+        quant_config = getattr(self.model.config, "quantization_config", None)
+        if quant_config is not None:
+            quant_method = (
+                quant_config.get("quant_method", "")
+                if isinstance(quant_config, dict)
+                else getattr(quant_config, "quant_method", "")
+            )
+            return quant_method in ("compressed-tensors", "fbgemm_fp8")
+        return False
+
     def get_merged_model(self) -> PreTrainedModel:
         # Guard against calling this method at the wrong time.
         assert isinstance(self.model, PeftModel)
@@ -271,8 +289,12 @@ class Model:
             merged_model = peft_model.merge_and_unload()
             return merged_model
         else:
-            # Non-quantized model - can merge directly
-            print("* Merging LoRA adapters into base model...")
+            # Non-quantized or FP8 model - merge directly.
+            # For FP8 (compressed-tensors), PEFT handles dequantization during merge.
+            if self._is_fp8_quantized():
+                print("* Merging LoRA adapters into FP8 model (output will be in full precision)...")
+            else:
+                print("* Merging LoRA adapters into base model...")
             merged_model = self.model.merge_and_unload()
             # merge_and_unload() modifies self.model in-place, destroying LoRA adapters.
             # Mark for full reload if user switches trials later.
@@ -386,6 +408,12 @@ class Model:
             for expert in layer.moe.experts:  # ty:ignore[possibly-missing-attribute, not-iterable]
                 try_add("mlp.down_proj", expert.output_linear)  # ty:ignore[possibly-missing-attribute]
 
+        # GLM-5 (GlmMoeDsa) MoE layers have shared experts with standard MLP structure.
+        # The routed experts use fused 3D parameter tensors (nn.Parameter, not nn.Module),
+        # so only the shared experts can be targeted by LoRA.
+        with suppress(Exception):
+            try_add("mlp.down_proj", layer.mlp.shared_experts.down_proj)  # ty:ignore[possibly-missing-attribute]
+
         # We need at least one module across all components for abliteration to work.
         total_modules = sum(len(mods) for mods in modules.values())
         assert total_modules > 0, "No abliterable modules found in layer"
@@ -474,10 +502,8 @@ class Model:
                     base_weight = cast(Tensor, module.base_layer.weight)
                     quant_state = getattr(base_weight, "quant_state", None)
 
-                    if quant_state is None:
-                        W = base_weight.to(torch.float32)
-                    else:
-                        # 4-bit quantization.
+                    if quant_state is not None:
+                        # BNB 4-bit quantization.
                         # This cast is always valid. Type inference fails here because the
                         # bnb.functional module is not found by ty for some reason.
                         W = cast(
@@ -487,6 +513,27 @@ class Model:
                                 quant_state,
                             ).to(torch.float32),
                         )
+                    elif base_weight.dtype in (torch.float8_e4m3fn, torch.float8_e5m2):
+                        # FP8 quantization (e.g. compressed-tensors).
+                        W = base_weight.to(torch.float32)
+                        weight_scale = getattr(module.base_layer, "weight_scale", None)
+                        if weight_scale is not None:
+                            scale = weight_scale.to(
+                                device=W.device, dtype=torch.float32
+                            )
+                            if scale.dim() < 2 or scale.numel() == 1:
+                                # Per-tensor or per-channel scale.
+                                W = W * scale
+                            else:
+                                # Per-block scale: expand to match weight dimensions.
+                                block_h = W.shape[0] // scale.shape[0]
+                                block_w = W.shape[1] // scale.shape[1]
+                                scale = scale.repeat_interleave(
+                                    block_h, dim=0
+                                ).repeat_interleave(block_w, dim=1)
+                                W = W * scale
+                    else:
+                        W = base_weight.to(torch.float32)
 
                     # Flatten weight matrix to (out_features, in_features).
                     W = W.view(W.shape[0], -1)
