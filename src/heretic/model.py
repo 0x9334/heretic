@@ -102,23 +102,12 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
-                max_memory = {}
-                for i in range(torch.cuda.device_count()):
-                    total = torch.cuda.get_device_properties(i).total_memory
-                    max_memory[i] = int(total * 0.85)
-
-                import psutil
-                max_memory["cpu"] = int(psutil.virtual_memory().available * 0.9)
-
-                self.max_memory = max_memory
                 extra_kwargs["local_files_only"] = True
-
 
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
                     dtype=dtype,
                     device_map=settings.device_map,
-                    max_memory=self.max_memory,
                     trust_remote_code=self.trusted_models.get(settings.model),
                     **extra_kwargs,
                 )
@@ -148,8 +137,8 @@ class Model:
 
             if settings.quantization == QuantizationMethod.BNB_4BIT:
                 print("[green]Ok[/] (quantized to 4-bit precision)")
-            elif self._is_fp8_quantized():
-                print("[green]Ok[/] (FP8 quantized)")
+            elif self._is_natively_quantized():
+                print("[green]Ok[/] (natively quantized)")
             else:
                 print("[green]Ok[/]")
 
@@ -219,6 +208,15 @@ class Model:
         # self.peft_config is a LoraConfig object rather than a dictionary,
         # so the result is a PeftModel rather than a PeftMixedModel.
         self.model = cast(PeftModel, get_peft_model(self.model, self.peft_config))
+
+        # For FP8 quantized models (compressed-tensors), PEFT initializes LoRA
+        # adapter weights in Float8_e4m3fn/Float8_e5m2 (via self.to(self.weight.dtype)
+        # in update_layer). CUDA does not support standard matmul (addmm) on FP8
+        # tensors, so we must cast all LoRA sub-modules to bfloat16.
+        for module in self.model.modules():
+            if hasattr(module, "lora_A") and hasattr(module, "lora_B"):
+                for lora_module in (*module.lora_A.values(), *module.lora_B.values()):
+                    lora_module.to(torch.bfloat16)
 
         print(f"* LoRA adapters initialized (targets: {', '.join(target_modules)})")
 
@@ -344,24 +342,12 @@ class Model:
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
 
-        # Recompute max_memory limits on reset, mirroring initial load behavior.
-        max_memory = {}
-        for i in range(torch.cuda.device_count()):
-            total = torch.cuda.get_device_properties(i).total_memory
-            max_memory[i] = int(total * 0.85)
-
-        import psutil
-
-        max_memory["cpu"] = int(psutil.virtual_memory().available * 0.9)
-
-        self.max_memory = max_memory
         extra_kwargs["local_files_only"] = True
 
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
             dtype=dtype,
             device_map=self.settings.device_map,
-            max_memory=self.max_memory,
             trust_remote_code=self.trusted_models.get(self.settings.model),
             **extra_kwargs,
         )
