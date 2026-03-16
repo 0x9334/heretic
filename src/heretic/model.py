@@ -102,6 +102,18 @@ class Model:
                 if quantization_config is not None:
                     extra_kwargs["quantization_config"] = quantization_config
 
+                max_memory = {}
+                for i in range(torch.cuda.device_count()):
+                    total = torch.cuda.get_device_properties(i).total_memory
+                    max_memory[i] = int(total * 0.85)
+
+                import psutil
+                max_memory["cpu"] = int(psutil.virtual_memory().available * 0.9)
+
+                self.max_memory = max_memory
+                extra_kwargs["local_files_only"] = True
+
+
                 self.model = get_model_class(settings.model).from_pretrained(
                     settings.model,
                     dtype=dtype,
@@ -331,6 +343,19 @@ class Model:
         extra_kwargs = {}
         if quantization_config is not None:
             extra_kwargs["quantization_config"] = quantization_config
+
+        # Recompute max_memory limits on reset, mirroring initial load behavior.
+        max_memory = {}
+        for i in range(torch.cuda.device_count()):
+            total = torch.cuda.get_device_properties(i).total_memory
+            max_memory[i] = int(total * 0.85)
+
+        import psutil
+
+        max_memory["cpu"] = int(psutil.virtual_memory().available * 0.9)
+
+        self.max_memory = max_memory
+        extra_kwargs["local_files_only"] = True
 
         self.model = get_model_class(self.settings.model).from_pretrained(
             self.settings.model,
